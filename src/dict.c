@@ -190,6 +190,7 @@ int _dictInit(dict *d, dictType *type,
     d->privdata = privDataPtr;
     d->rehashidx = -1;
     d->iterators = 0;
+    d->unsafe_iterators = 0;
     return DICT_OK;
 }
 
@@ -307,6 +308,7 @@ int dictRehashMilliseconds(dict *d, int ms) {
  * dictionary so that the hash table automatically migrates from H1 to H2
  * while it is actively used. */
 static void _dictRehashStep(dict *d) {
+    assert(d->unsafe_iterators == 0);
     if (d->iterators == 0) dictRehash(d,1);
 }
 
@@ -530,8 +532,12 @@ dictEntry *dictNext(dictIterator *iter)
     while (1) {
         if (iter->entry == NULL) {
             dictht *ht = &iter->d->ht[iter->table];
-            if (iter->safe && iter->index == -1 && iter->table == 0)
-                iter->d->iterators++;
+            if (iter->index == -1 && iter->table == 0) {
+                if (iter->safe)
+                    iter->d->iterators++;
+                else
+                    iter->d->unsafe_iterators++;
+            }
             iter->index++;
             if (iter->index >= (signed) ht->size) {
                 if (dictIsRehashing(iter->d) && iter->table == 0) {
@@ -558,8 +564,12 @@ dictEntry *dictNext(dictIterator *iter)
 
 void dictReleaseIterator(dictIterator *iter)
 {
-    if (iter->safe && !(iter->index == -1 && iter->table == 0))
-        iter->d->iterators--;
+    if (!(iter->index == -1 && iter->table == 0)) {
+        if (iter->safe)
+            iter->d->iterators--;
+        else
+            iter->d->unsafe_iterators--;
+    }
     zfree(iter);
 }
 
@@ -674,6 +684,7 @@ void dictEmpty(dict *d) {
     _dictClear(d,&d->ht[1]);
     d->rehashidx = -1;
     d->iterators = 0;
+    d->unsafe_iterators = 0;
 }
 
 void dictEnableResize(void) {
