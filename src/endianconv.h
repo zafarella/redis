@@ -28,7 +28,7 @@
  * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
- */ 
+ */
 
 #ifndef __ENDIANCONV_H
 #define __ENDIANCONV_H
@@ -69,6 +69,10 @@ uint64_t intrev64(uint64_t v);
 #else
 #define htonu64(v) intrev64(v)
 #define ntohu64(v) intrev64(v)
+#endif
+
+#ifdef REDIS_TEST
+int endianconvTest(int argc, char *argv[]);
 #endif
 
 #endif

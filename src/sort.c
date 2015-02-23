@@ -194,6 +194,7 @@ void sortCommand(redisClient *c) {
     int j, dontsort = 0, vectorlen;
     int getop = 0; /* GET operation counter */
     int int_convertion_error = 0;
+    int syntax_error = 0;
     robj *sortval, *sortby = NULL, *storekey = NULL;
     redisSortObject *vector; /* Resulting vector to sort */
 
@@ -219,7 +220,7 @@ void sortCommand(redisClient *c) {
     if (sortval)
         incrRefCount(sortval);
     else
-        sortval = createListObject();
+        sortval = createQuicklistObject();
 
     /* The SORT command has an SQL-alike syntax, parse it */
     while(j < c->argc) {
@@ -231,8 +232,14 @@ void sortCommand(redisClient *c) {
         } else if (!strcasecmp(c->argv[j]->ptr,"alpha")) {
             alpha = 1;
         } else if (!strcasecmp(c->argv[j]->ptr,"limit") && leftargs >= 2) {
-            if ((getLongFromObjectOrReply(c, c->argv[j+1], &limit_start, NULL) != REDIS_OK) ||
-                (getLongFromObjectOrReply(c, c->argv[j+2], &limit_count, NULL) != REDIS_OK)) return;
+            if ((getLongFromObjectOrReply(c, c->argv[j+1], &limit_start, NULL)
+                 != REDIS_OK) ||
+                (getLongFromObjectOrReply(c, c->argv[j+2], &limit_count, NULL)
+                 != REDIS_OK))
+            {
+                syntax_error++;
+                break;
+            }
             j+=2;
         } else if (!strcasecmp(c->argv[j]->ptr,"store") && leftargs >= 1) {
             storekey = c->argv[j+1];
@@ -241,32 +248,52 @@ void sortCommand(redisClient *c) {
             sortby = c->argv[j+1];
             /* If the BY pattern does not contain '*', i.e. it is constant,
              * we don't need to sort nor to lookup the weight keys. */
-            if (strchr(c->argv[j+1]->ptr,'*') == NULL) dontsort = 1;
+            if (strchr(c->argv[j+1]->ptr,'*') == NULL) {
+                dontsort = 1;
+            } else {
+                /* If BY is specified with a real patter, we can't accept
+                 * it in cluster mode. */
+                if (server.cluster_enabled) {
+                    addReplyError(c,"BY option of SORT denied in Cluster mode.");
+                    syntax_error++;
+                    break;
+                }
+            }
             j++;
         } else if (!strcasecmp(c->argv[j]->ptr,"get") && leftargs >= 1) {
+            if (server.cluster_enabled) {
+                addReplyError(c,"GET option of SORT denied in Cluster mode.");
+                syntax_error++;
+                break;
+            }
             listAddNodeTail(operations,createSortOperation(
                 REDIS_SORT_GET,c->argv[j+1]));
             getop++;
             j++;
         } else {
-            decrRefCount(sortval);
-            listRelease(operations);
             addReply(c,shared.syntaxerr);
-            return;
+            syntax_error++;
+            break;
         }
         j++;
     }
 
-    /* For the STORE option, or when SORT is called from a Lua script,
-     * we want to force a specific ordering even when no explicit ordering
-     * was asked (SORT BY nosort). This guarantees that replication / AOF
-     * is deterministic.
+    /* Handle syntax errors set during options parsing. */
+    if (syntax_error) {
+        decrRefCount(sortval);
+        listRelease(operations);
+        return;
+    }
+
+    /* When sorting a set with no sort specified, we must sort the output
+     * so the result is consistent across scripting and replication.
      *
-     * However in the case 'dontsort' is true, but the type to sort is a
-     * sorted set, we don't need to do anything as ordering is guaranteed
-     * in this special case. */
-    if ((storekey || c->flags & REDIS_LUA_CLIENT) &&
-        (dontsort && sortval->type != REDIS_ZSET))
+     * The other types (list, sorted set) will retain their native order
+     * even if no sort order is requested, so they remain stable across
+     * scripting and replication. */
+    if (dontsort &&
+        sortval->type == REDIS_SET &&
+        (storekey || c->flags & REDIS_LUA_CLIENT))
     {
         /* Force ALPHA sorting */
         dontsort = 0;
@@ -295,17 +322,17 @@ void sortCommand(redisClient *c) {
     }
     if (end >= vectorlen) end = vectorlen-1;
 
-    /* Optimization:
+    /* Whenever possible, we load elements into the output array in a more
+     * direct way. This is possible if:
      *
-     * 1) if the object to sort is a sorted set.
+     * 1) The object to sort is a sorted set or a list (internally sorted).
      * 2) There is nothing to sort as dontsort is true (BY <constant string>).
-     * 3) We have a LIMIT option that actually reduces the number of elements
-     *    to fetch.
      *
-     * In this case to load all the objects in the vector is a huge waste of
-     * resources. We just allocate a vector that is big enough for the selected
-     * range length, and make sure to load just this part in the vector. */
-    if (sortval->type == REDIS_ZSET &&
+     * In this special case, if we have a LIMIT option that actually reduces
+     * the number of elements to fetch, we also optimize to just load the
+     * range we are interested in and allocating a vector that is big enough
+     * for the selected range length. */
+    if ((sortval->type == REDIS_ZSET || sortval->type == REDIS_LIST) &&
         dontsort &&
         (start != 0 || end != vectorlen-1))
     {
@@ -316,7 +343,32 @@ void sortCommand(redisClient *c) {
     vector = zmalloc(sizeof(redisSortObject)*vectorlen);
     j = 0;
 
-    if (sortval->type == REDIS_LIST) {
+    if (sortval->type == REDIS_LIST && dontsort) {
+        /* Special handling for a list, if 'dontsort' is true.
+         * This makes sure we return elements in the list original
+         * ordering, accordingly to DESC / ASC options.
+         *
+         * Note that in this case we also handle LIMIT here in a direct
+         * way, just getting the required range, as an optimization. */
+        if (end >= start) {
+            listTypeIterator *li;
+            listTypeEntry entry;
+            li = listTypeInitIterator(sortval,
+                    desc ? (long)(listTypeLength(sortval) - start - 1) : start,
+                    desc ? REDIS_HEAD : REDIS_TAIL);
+
+            while(j < vectorlen && listTypeNext(li,&entry)) {
+                vector[j].obj = listTypeGet(&entry);
+                vector[j].u.score = 0;
+                vector[j].u.cmpobj = NULL;
+                j++;
+            }
+            listTypeReleaseIterator(li);
+            /* Fix start/end: output code is not aware of this optimization. */
+            end -= start;
+            start = 0;
+        }
+    } else if (sortval->type == REDIS_LIST) {
         listTypeIterator *li = listTypeInitIterator(sortval,0,REDIS_TAIL);
         listTypeEntry entry;
         while(listTypeNext(li,&entry)) {
@@ -372,10 +424,7 @@ void sortCommand(redisClient *c) {
             j++;
             ln = desc ? ln->backward : ln->level[0].forward;
         }
-        /* The code producing the output does not know that in the case of
-         * sorted set, 'dontsort', and LIMIT, we are able to get just the
-         * range, already sorted, so we need to adjust "start" and "end"
-         * to make sure start is set to 0. */
+        /* Fix start/end: output code is not aware of this optimization. */
         end -= start;
         start = 0;
     } else if (sortval->type == REDIS_ZSET) {
@@ -482,7 +531,7 @@ void sortCommand(redisClient *c) {
             }
         }
     } else {
-        robj *sobj = createZiplistObject();
+        robj *sobj = createQuicklistObject();
 
         /* STORE option specified, set the sorting result as a List object */
         for (j = start; j <= end; j++) {
