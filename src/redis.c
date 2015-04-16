@@ -202,6 +202,7 @@ struct redisCommand redisCommandTable[] = {
     {"hincrbyfloat",hincrbyfloatCommand,4,"wmF",0,NULL,1,1,1,0,0},
     {"hdel",hdelCommand,-3,"wF",0,NULL,1,1,1,0,0},
     {"hlen",hlenCommand,2,"rF",0,NULL,1,1,1,0,0},
+    {"hstrlen",hstrlenCommand,3,"rF",0,NULL,1,1,1,0,0},
     {"hkeys",hkeysCommand,2,"rS",0,NULL,1,1,1,0,0},
     {"hvals",hvalsCommand,2,"rS",0,NULL,1,1,1,0,0},
     {"hgetall",hgetallCommand,2,"r",0,NULL,1,1,1,0,0},
@@ -925,8 +926,14 @@ int clientsCronHandleTimeout(redisClient *c) {
         mstime_t now_ms = mstime();
 
         if (c->bpop.timeout != 0 && c->bpop.timeout < now_ms) {
+            /* Handle blocking operation specific timeout. */
             replyToBlockedClientTimedOut(c);
             unblockClient(c);
+        } else if (server.cluster_enabled) {
+            /* Cluster: handle unblock & redirect of clients blocked
+             * into keys no longer served by this server. */
+            if (clusterRedirectBlockedClientIfNeeded(c))
+                unblockClient(c);
         }
     }
     return 0;
@@ -1259,6 +1266,12 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 void beforeSleep(struct aeEventLoop *eventLoop) {
     REDIS_NOTUSED(eventLoop);
 
+    /* Call the Redis Cluster before sleep function. Note that this function
+     * may change the state of Redis Cluster (from ok to fail or vice versa),
+     * so it's a good idea to call it before serving the unblocked clients
+     * later in this function. */
+    if (server.cluster_enabled) clusterBeforeSleep();
+
     /* Run a fast expire cycle (the called function will return
      * ASAP if a fast cycle is not needed). */
     if (server.active_expire_enabled && server.masterhost == NULL)
@@ -1290,9 +1303,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Write the AOF buffer on disk */
     flushAppendOnlyFile(0);
-
-    /* Call the Redis Cluster before sleep function. */
-    if (server.cluster_enabled) clusterBeforeSleep();
 }
 
 /* =========================== Server initialization ======================== */
@@ -1780,7 +1790,7 @@ void initServer(void) {
         server.sofd = anetUnixServer(server.neterr,server.unixsocket,
             server.unixsocketperm, server.tcp_backlog);
         if (server.sofd == ANET_ERR) {
-            redisLog(REDIS_WARNING, "Opening socket: %s", server.neterr);
+            redisLog(REDIS_WARNING, "Opening Unix socket: %s", server.neterr);
             exit(1);
         }
         anetNonBlock(NULL,server.sofd);
@@ -2195,36 +2205,22 @@ int processCommand(redisClient *c) {
      * 2) The command has no key arguments. */
     if (server.cluster_enabled &&
         !(c->flags & REDIS_MASTER) &&
+        !(c->flags & REDIS_LUA_CLIENT &&
+          server.lua_caller->flags & REDIS_MASTER) &&
         !(c->cmd->getkeys_proc == NULL && c->cmd->firstkey == 0))
     {
         int hashslot;
 
         if (server.cluster->state != REDIS_CLUSTER_OK) {
             flagTransaction(c);
-            addReplySds(c,sdsnew("-CLUSTERDOWN The cluster is down. Use CLUSTER INFO for more information\r\n"));
+            clusterRedirectClient(c,NULL,0,REDIS_CLUSTER_REDIR_DOWN_STATE);
             return REDIS_OK;
         } else {
             int error_code;
             clusterNode *n = getNodeByQuery(c,c->cmd,c->argv,c->argc,&hashslot,&error_code);
-            if (n == NULL) {
+            if (n == NULL || n != server.cluster->myself) {
                 flagTransaction(c);
-                if (error_code == REDIS_CLUSTER_REDIR_CROSS_SLOT) {
-                    addReplySds(c,sdsnew("-CROSSSLOT Keys in request don't hash to the same slot\r\n"));
-                } else if (error_code == REDIS_CLUSTER_REDIR_UNSTABLE) {
-                    /* The request spawns mutliple keys in the same slot,
-                     * but the slot is not "stable" currently as there is
-                     * a migration or import in progress. */
-                    addReplySds(c,sdsnew("-TRYAGAIN Multiple keys request during rehashing of slot\r\n"));
-                } else {
-                    redisPanic("getNodeByQuery() unknown error.");
-                }
-                return REDIS_OK;
-            } else if (n != server.cluster->myself) {
-                flagTransaction(c);
-                addReplySds(c,sdscatprintf(sdsempty(),
-                    "-%s %d %s:%d\r\n",
-                    (error_code == REDIS_CLUSTER_REDIR_ASK) ? "ASK" : "MOVED",
-                    hashslot,n->ip,n->port));
+                clusterRedirectClient(c,n,hashslot,error_code);
                 return REDIS_OK;
             }
         }
@@ -2736,9 +2732,13 @@ sds genRedisInfoString(char *section) {
         char hmem[64];
         char peak_hmem[64];
         char total_system_hmem[64];
+        char used_memory_lua_hmem[64];
+        char used_memory_rss_hmem[64];
+        char maxmemory_hmem[64];
         size_t zmalloc_used = zmalloc_used_memory();
         size_t total_system_mem = server.system_memory_size;
-        char *evict_policy = maxmemoryToString();
+        const char *evict_policy = maxmemoryToString();
+        long long memory_lua = (long long)lua_gc(server.lua,LUA_GCCOUNT,0)*1024;
 
         /* Peak memory is updated from time to time by serverCron() so it
          * may happen that the instantaneous value is slightly bigger than
@@ -2750,6 +2750,9 @@ sds genRedisInfoString(char *section) {
         bytesToHuman(hmem,zmalloc_used);
         bytesToHuman(peak_hmem,server.stat_peak_memory);
         bytesToHuman(total_system_hmem,total_system_mem);
+        bytesToHuman(used_memory_lua_hmem,memory_lua);
+        bytesToHuman(used_memory_rss_hmem,server.resident_set_size);
+        bytesToHuman(maxmemory_hmem,server.maxmemory);
 
         if (sections++) info = sdscat(info,"\r\n");
         info = sdscatprintf(info,
@@ -2757,25 +2760,33 @@ sds genRedisInfoString(char *section) {
             "used_memory:%zu\r\n"
             "used_memory_human:%s\r\n"
             "used_memory_rss:%zu\r\n"
+            "used_memory_rss_human:%s\r\n"
             "used_memory_peak:%zu\r\n"
             "used_memory_peak_human:%s\r\n"
             "total_system_memory:%lu\r\n"
             "total_system_memory_human:%s\r\n"
             "used_memory_lua:%lld\r\n"
+            "used_memory_lua_human:%s\r\n"
+            "maxmemory:%lld\r\n"
+            "maxmemory_human:%s\r\n"
+            "maxmemory_policy:%s\r\n"
             "mem_fragmentation_ratio:%.2f\r\n"
-            "mem_allocator:%s\r\n"
-            "maxmemory_policy:%s\r\n",
+            "mem_allocator:%s\r\n",
             zmalloc_used,
             hmem,
             server.resident_set_size,
+            used_memory_rss_hmem,
             server.stat_peak_memory,
             peak_hmem,
             (unsigned long)total_system_mem,
             total_system_hmem,
-            ((long long)lua_gc(server.lua,LUA_GCCOUNT,0))*1024LL,
+            memory_lua,
+            used_memory_lua_hmem,
+            server.maxmemory,
+            maxmemory_hmem,
+            evict_policy,
             zmalloc_get_fragmentation_ratio(server.resident_set_size),
-            ZMALLOC_LIB,
-            evict_policy
+            ZMALLOC_LIB
             );
     }
 
